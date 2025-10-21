@@ -1,17 +1,48 @@
-# Automated Dockerized App Deployment Script
+# Automated Dockerized Flask App Deployment with Nginx Reverse Proxy
 
-This repository contains **`deploy.sh`**, a production-grade Bash script that automates the setup, deployment, and configuration of a Dockerized application on a remote Linux server — complete with **NGINX reverse proxy** configuration.
+This project contains:
+- A **POSIX-compliant `deploy.sh`** script that automates deployment of a Dockerized Flask app to a remote Linux server.
+- A **simple Flask web app** (`app.py`) running behind **Nginx as a reverse proxy**.
+- Configuration for **idempotent**, repeatable deployments on **AWS EC2** or any SSH-accessible server.
 
 ---
 
 ## Features
 
-- Secure SSH-based deployment  
-- Automatic Docker & NGINX installation (if missing)  
-- Supports both `Dockerfile` and `docker-compose.yml`  
-- Real-time validation and logging  
-- Safe re-runs (idempotent)  
-- Optional cleanup flag  
+- Interactive user input for repo and server details  
+- Automated installation of Docker, Docker Compose, and Nginx  
+- Secure file transfer using SSH and rsync  
+- Dynamic Nginx reverse proxy configuration  
+- Automatic app validation via HTTP request  
+- Supports `--dry-run` and `--cleanup` modes  
+- Fully **POSIX-compliant** (runs on `/bin/sh`)
+
+---
+
+## Flask App Overview
+
+The included Flask app (`app.py`) exposes two endpoints:
+
+- `/` → Returns a plain text welcome message  
+- `/api` → Returns JSON confirmation of successful deployment
+
+### Example Output
+
+```bash
+$ curl http://<EC2_PUBLIC_IP>/api
+{"message":"Flask app deployed successfully via deploy.sh","status":"OK"}
+```
+
+---
+
+## Prerequisites
+
+- Local machine with:
+  - `git`, `ssh`, `rsync`, `curl`
+- Remote server (e.g., AWS EC2) with:
+  - SSH access (key-based)
+  - `sudo` privileges
+- A GitHub repository containing this project’s files
 
 ---
 
@@ -22,83 +53,50 @@ This repository contains **`deploy.sh`**, a production-grade Bash script that au
 chmod +x deploy.sh
 ```
 
-### 2 Run the script
-Execute the script and follow the interactive prompts:
+### 2 Run interactively
 ```bash
 ./deploy.sh
 ```
 
-The script will prompt you for:
+You’ll be prompted for:
+- GitHub repo URL (HTTPS)
+- Branch name (default: main)
+- Personal Access Token (PAT)
+- Remote SSH username (e.g., ubuntu)
+- Remote host (EC2 IP address)
+- SSH key path (e.g., ~/.ssh/mykey.pem)
+- Application internal port (e.g., 5000)
 
-- Git Repository URL  
-- Personal Access Token (PAT)  
-- Branch name *(optional, defaults to main)*  
-- Remote Server SSH details:  
-  - Username  
-  - Server IP  
-  - SSH key path  
-- Application port (internal container port)
-
----
-
-## Example Input
-
-When prompted, enter details like:
-```
-Enter GitHub Repository URL: https://github.com/yourusername/sample-docker-app.git
-Enter Personal Access Token (PAT): ghp_abcd1234efgh5678ijkl
-Enter Branch name (default: main): main
-Enter SSH username: ec2-user
-Enter Server IP: 3.120.45.67
-Enter path to SSH private key: ~/.ssh/my-key.pem
-Enter internal app port: 5000
-```
-
----
-
-## Flags
+### 3 Optional flags
 
 | Flag | Description |
 |------|--------------|
-| `--cleanup` | Removes deployed Docker containers, images, and NGINX config before re-deployment |
-| `--help` | Displays usage information |
+| `--dry-run` | Prints actions without making remote changes |
+| `--cleanup` | Removes deployed app and Nginx config from remote server |
+| `-h`, `--help` | Shows help info |
 
-### Example:
+Example:
+```bash
+./deploy.sh --dry-run
+```
+
+---
+
+## Accessing the App
+
+Once deployment is complete, visit:
+```
+http://<EC2_PUBLIC_IP>/api
+```
+You should receive a **JSON response** confirming successful deployment.
+
+---
+
+## Cleanup
+
+To stop and remove deployed containers and configurations:
 ```bash
 ./deploy.sh --cleanup
 ```
 
 ---
-
-## Logs
-
-All actions are logged in a file named:
-```
-deploy_YYYYMMDD.log
-```
-
-You can view logs after execution:
-```bash
-cat deploy_20251020.log
-```
-
----
-
-## Prerequisites
-
-- Bash 4.0+  
-- SSH access to the remote Linux server  
-- GitHub Personal Access Token (PAT) with repo access  
-- The remote server must allow inbound port **80**
-
----
-
-## Example Application
-
-This repo includes a simple **Python Flask app** and a **Dockerfile** that serves a “Hello from Flask!” message on port 5000.
-
----
-
-## License
-
-MIT License — feel free to modify and adapt for your own DevOps projects.

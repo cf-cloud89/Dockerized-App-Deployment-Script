@@ -115,19 +115,22 @@ EOF
 # ========== 6. CONFIGURE NGINX REVERSE PROXY ==========
 log "Configuring NGINX as reverse proxy..."
 NGINX_CONF="/etc/nginx/conf.d/hngapp.conf"
-ssh -i "$SSH_KEY" "$SSH_USER@$SERVER_IP" "sudo sh -c 'cat > $NGINX_CONF <<CONFIG
+
+ssh -i "$SSH_KEY" "$SSH_USER@$SERVER_IP" <<EOF
+sudo tee /etc/nginx/conf.d/hngapp.conf > /dev/null <<CONFIG
 server {
     listen 80;
     server_name _;
     location / {
-        proxy_pass http://127.0.0.1:$APP_PORT;
+        proxy_pass http://127.0.0.1:${APP_PORT};
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     }
 }
 CONFIG
-sudo nginx -t && sudo systemctl reload nginx'"
+sudo nginx -t && sudo systemctl reload nginx
+EOF
 
 # ========== 7. VALIDATION ==========
 log "Validating deployment..."

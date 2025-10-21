@@ -1,4 +1,4 @@
-# Automated Dockerized Flask App Deployment with Nginx Reverse Proxy
+# Automated Dockerized App Deployment Script
 
 This project contains:
 - A **POSIX-compliant `deploy.sh`** script that automates deployment of a Dockerized Flask app to a remote Linux server.

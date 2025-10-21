@@ -105,16 +105,16 @@ if [ -f docker-compose.yml ]; then
   sudo docker-compose down || true
   sudo docker-compose up -d --build
 else
-  sudo docker build -t myapp .
-  sudo docker stop myapp || true
-  sudo docker rm myapp || true
-  sudo docker run -d -p $APP_PORT:$APP_PORT --name myapp myapp
+  sudo docker build -t hngapp .
+  sudo docker stop hngapp || true
+  sudo docker rm hngapp || true
+  sudo docker run -d -p $APP_PORT:$APP_PORT --name hngapp hngapp
 fi
 EOF
 
 # ========== 6. CONFIGURE NGINX REVERSE PROXY ==========
 log "Configuring NGINX as reverse proxy..."
-NGINX_CONF="/etc/nginx/conf.d/myapp.conf"
+NGINX_CONF="/etc/nginx/conf.d/hngapp.conf"
 ssh -i "$SSH_KEY" "$SSH_USER@$SERVER_IP" "sudo sh -c 'cat > $NGINX_CONF <<CONFIG
 server {
     listen 80;
@@ -123,6 +123,7 @@ server {
         proxy_pass http://127.0.0.1:$APP_PORT;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     }
 }
 CONFIG

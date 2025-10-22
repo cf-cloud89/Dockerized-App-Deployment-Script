@@ -2,7 +2,6 @@
 
 #######################################
 # Dockerized Application Deployment Script
-# Author: DevOps Track Stage 1
 # Description: Automates deployment of Dockerized apps to remote servers
 #######################################
 
@@ -258,7 +257,7 @@ execute_remote_command() {
 prepare_remote_environment() {
     log_info "=== Preparing Remote Environment ==="
     
-    execute_remote_command "sudo apt-get update -y" || {
+    execute_remote_command "sudo dnf-get update -y" || {
         log_error "Failed to update packages"
         exit 1
     }
@@ -266,11 +265,11 @@ prepare_remote_environment() {
     log_info "Installing Docker..."
     execute_remote_command "
         if ! command -v docker &> /dev/null; then
-            sudo apt-get install -y apt-transport-https ca-certificates curl software-properties-common
+            sudo dnf-get install -y dnf-transport-https ca-certificates curl software-properties-common
             curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
-            echo 'deb [arch=\$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu \$(lsb_release -cs) stable' | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-            sudo apt-get update -y
-            sudo apt-get install -y docker-ce docker-ce-cli containerd.io
+            echo 'deb [arch=\$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu \$(lsb_release -cs) stable' | sudo tee /etc/dnf/sources.list.d/docker.list > /dev/null
+            sudo dnf-get update -y
+            sudo dnf-get install -y docker-ce docker-ce-cli containerd.io
         fi
     " || log_warn "Docker might already be installed"
     
@@ -285,7 +284,7 @@ prepare_remote_environment() {
     log_info "Installing Nginx..."
     execute_remote_command "
         if ! command -v nginx &> /dev/null; then
-            sudo apt-get install -y nginx
+            sudo dnf-get install -y nginx
         fi
     " || log_warn "Nginx might already be installed"
     

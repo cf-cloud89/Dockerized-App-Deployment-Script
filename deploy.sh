@@ -574,6 +574,7 @@ main() {
     
     # Main deployment flow
     collect_parameters
+    calculate_repo_name
     clone_or_update_repo
     verify_docker_files
     test_ssh_connection

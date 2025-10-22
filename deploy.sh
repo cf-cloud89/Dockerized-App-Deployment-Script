@@ -1,458 +1,568 @@
-#!/usr/bin/env bash
-#
-# deploy.sh - full deployment automation for Dockerized app + NGINX reverse proxy
-# Follows the Task Breakdown provided by the user
-#
-# Usage:
-#   ./deploy.sh           # interactive deploy
-#   ./deploy.sh --dry-run # show actions but do not modify remote host
-#   ./deploy.sh --cleanup # cleanup deployed resources on remote host
-#
-set -o errexit
-set -o nounset
-set -o pipefail
+#!/bin/bash
 
-########################################
-# Configuration & globals
-########################################
-TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
-LOGFILE="$(pwd)/deploy_${TIMESTAMP}.log"
-DRY_RUN=0
-CLEANUP=0
+#######################################
+# Dockerized Application Deployment Script
+# Description: Automates deployment of Dockerized apps to remote servers
+#######################################
 
-# default ssh options (do not change unless you know why)
-SSH_DEFAULT_OPTS="-o BatchMode=yes -o ConnectTimeout=15"
+set -euo pipefail
 
-########################################
-# Helpers
-########################################
-log() { printf "%s | INFO  | %s\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOGFILE"; }
-warn() { printf "%s | WARN  | %s\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOGFILE" >&2; }
-err() { printf "%s | ERROR | %s\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOGFILE" >&2; }
-die() { err "$*"; exit "${2:-1}"; }
+# # Color codes for output
+# RED='\033[0;31m'
+# GREEN='\033[0;32m'
+# YELLOW='\033[1;33m'
+# BLUE='\033[0;34m'
+# NC='\033[0m' # No Color
 
-mask_token() {
-  local t="$1"
-  [ -z "$t" ] && printf "%s" "" && return
-  [ "${#t}" -le 8 ] && printf "****" && return
-  printf "%s...%s" "${t:0:4}" "${t: -4}"
+# Global variables
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOG_FILE="${SCRIPT_DIR}/deploy_$(date +%Y%m%d_%H%M%S).log"
+TEMP_DIR="${SCRIPT_DIR}/temp_deploy"
+CLEANUP_MODE=false
+
+#######################################
+# Logging Functions
+#######################################
+
+log() {
+    local level=$1
+    shift
+    local message="$*"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo -e "${timestamp} [${level}] ${message}" | tee -a "$LOG_FILE"
 }
 
-usage() {
-  cat <<EOF
-Usage: $0 [--dry-run] [--cleanup] [-h|--help]
-  --dry-run   : Print actions, do not perform remote changes
-  --cleanup   : Remove containers and nginx config from remote (requires same inputs)
-  -h, --help   : Show this help
-EOF
-  exit 0
+log_info() {
+    echo -e "${BLUE}[INFO]${NC} $*" | tee -a "$LOG_FILE"
 }
 
-########################################
-# Argument parsing
-########################################
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --dry-run) DRY_RUN=1; shift ;;
-    --cleanup) CLEANUP=1; shift ;;
-    -h|--help) usage ;;
-    *) die "Unknown option: $1" ;;
-  esac
-done
-
-########################################
-# Trap / cleanup
-########################################
-on_exit() {
-  local rc=$?
-  if [ $rc -ne 0 ]; then
-    err "Script failed with exit code $rc. See $LOGFILE"
-  else
-    log "Script finished (exit code 0). Log: $LOGFILE"
-  fi
-}
-trap on_exit EXIT
-
-########################################
-# 1) Collect and validate inputs
-########################################
-collect_inputs() {
-  log "Collecting inputs..."
-
-  printf "Git Repository URL (HTTPS): "
-  read -r GIT_URL
-  [ -n "$GIT_URL" ] || die "Git repo URL is required." 10
-
-  printf "Branch (default: main): "
-  read -r GIT_BRANCH
-  GIT_BRANCH=${GIT_BRANCH:-main}
-
-  printf "Personal Access Token (PAT) (will be hidden): "
-  stty -echo
-  read -r GIT_PAT
-  stty echo
-  printf "\n"
-  [ -n "$GIT_PAT" ] || die "Personal Access Token is required." 11
-
-  printf "Remote SSH username (e.g. ec2-user, ubuntu): "
-  read -r SSH_USER
-  [ -n "$SSH_USER" ] || die "SSH username required." 12
-
-  printf "Remote host (IP or hostname): "
-  read -r REMOTE_HOST
-  [ -n "$REMOTE_HOST" ] || die "Remote host required." 13
-
-  printf "SSH private key path (absolute or ~ path): "
-  read -r SSH_KEY
-  [ -n "$SSH_KEY" ] || die "SSH key path required." 14
-  # expand ~
-  SSH_KEY="${SSH_KEY/#\~/$HOME}"
-  [ -f "$SSH_KEY" ] || die "SSH private key not found at $SSH_KEY" 15
-
-  printf "Internal container port (container listens on this port, e.g. 5000): "
-  read -r APP_PORT
-  printf '%s' "$APP_PORT" | grep -qE '^[0-9]+$' || die "Invalid app port." 16
-
-  # log masked inputs
-  log "Inputs: repo=$(printf '%.120s' "$GIT_URL"), branch=$GIT_BRANCH, PAT=$(mask_token "$GIT_PAT"), remote=${SSH_USER}@${REMOTE_HOST}, ssh_key=$SSH_KEY, app_port=$APP_PORT"
+log_success() {
+    echo -e "${GREEN}[SUCCESS]${NC} $*" | tee -a "$LOG_FILE"
 }
 
-########################################
-# 2) Local prechecks and clone/pull
-########################################
-prechecks_and_clone() {
-  log "Running local prechecks..."
-  for cmd in ssh rsync git curl; do
-    command -v "$cmd" >/dev/null 2>&1 || die "Required command not found: $cmd" 20
-  done
-
-  mkdir -p ./deploy_workspace
-  cd ./deploy_workspace || die "Failed to cd to workspace" 21
-
-  REPO_DIR="$(basename -s .git "$GIT_URL")"
-  AUTH_URL="$(printf "%s" "$GIT_URL" | sed -e "s#https://#https://${GIT_PAT}@#")"
-
-  if [ -d "$REPO_DIR/.git" ]; then
-    log "Repository exists locally, fetching changes..."
-    cd "$REPO_DIR" || die "cd repo failed" 22
-    git fetch --all --prune >>"$LOGFILE" 2>&1 || die "git fetch failed" 23
-    git checkout "$GIT_BRANCH" >>"$LOGFILE" 2>&1 || die "git checkout $GIT_BRANCH failed" 24
-    git pull origin "$GIT_BRANCH" >>"$LOGFILE" 2>&1 || die "git pull failed" 25
-  else
-    log "Cloning repository branch '$GIT_BRANCH'..."
-    git clone --branch "$GIT_BRANCH" --single-branch "$AUTH_URL" "$REPO_DIR" >>"$LOGFILE" 2>&1 || die "git clone failed" 26
-    cd "$REPO_DIR" || die "cd repo failed" 27
-  fi
-
-  PROJECT_DIR="$(pwd)"
-  log "Project directory: $PROJECT_DIR"
-
-  if [ ! -f "Dockerfile" ] && [ ! -f "docker-compose.yml" ] && [ ! -f "docker-compose.yaml" ]; then
-    die "No Dockerfile or docker-compose.yml found in project root ($PROJECT_DIR)" 28
-  fi
-  log "Found Dockerfile/docker-compose in project root."
+log_warn() {
+    echo -e "${YELLOW}[WARN]${NC} $*" | tee -a "$LOG_FILE"
 }
 
-########################################
-# 3) SSH connectivity check
-########################################
-ssh_check() {
-  log "Checking SSH connectivity to ${SSH_USER}@${REMOTE_HOST}..."
-  if [ "$DRY_RUN" -eq 1 ]; then
-    log "[dry-run] would run: ssh -i $SSH_KEY $SSH_DEFAULT_OPTS $SSH_USER@$REMOTE_HOST 'echo OK'"
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $*" | tee -a "$LOG_FILE"
+}
+
+#######################################
+# Error Handling
+#######################################
+
+cleanup_on_error() {
+    log_error "Script encountered an error. Cleaning up..."
+    if [ -d "$TEMP_DIR" ]; then
+        rm -rf "$TEMP_DIR"
+    fi
+    exit 1
+}
+
+trap cleanup_on_error ERR
+trap 'log_info "Script interrupted by user"; exit 130' INT TERM
+
+#######################################
+# Validation Functions
+#######################################
+
+validate_url() {
+    local url=$1
+    if [[ ! "$url" =~ ^https?://.*\.git$ ]] && [[ ! "$url" =~ ^git@.*:.+\.git$ ]]; then
+        log_error "Invalid Git repository URL format"
+        return 1
+    fi
     return 0
-  fi
-
-  # attempt a harmless echo to check connectivity; use StrictHostKeyChecking=accept-new if supported else no
-  ssh -i "$SSH_KEY" $SSH_DEFAULT_OPTS -o StrictHostKeyChecking=accept-new "${SSH_USER}@${REMOTE_HOST}" "echo SSH_OK" >/dev/null 2>&1 || \
-    die "SSH connectivity failed to ${REMOTE_HOST}. Try connecting manually with: ssh -i $SSH_KEY ${SSH_USER}@${REMOTE_HOST}" 30
-
-  log "SSH connectivity OK"
 }
 
-########################################
-# 4) Remote preparation script
-########################################
-remote_prep() {
-  log "Preparing remote environment..."
-
-  remote_script="$(mktemp)"
-  cat >"$remote_script" <<'REMOTE_EOF'
-set -e
-# detect package manager
-if command -v apt-get >/dev/null 2>&1; then
-  PKG_UPDATE="sudo apt-get update -y"
-  PKG_INSTALL="sudo apt-get install -y"
-elif command -v yum >/dev/null 2>&1; then
-  PKG_UPDATE="sudo yum update -y"
-  PKG_INSTALL="sudo yum install -y"
-else
-  echo "NO_SUPPORTED_PKG_MANAGER"
-  exit 1
-fi
-
-# update packages
-echo "UPDATING"
-$PKG_UPDATE
-
-# install prerequisites
-$PKG_INSTALL curl ca-certificates openssl -y || true
-
-# docker
-if ! command -v docker >/dev/null 2>&1; then
-  echo "Installing docker..."
-  curl -fsSL https://get.docker.com | sh
-fi
-sudo systemctl enable --now docker || true
-
-# docker-compose plugin/binary best-effort
-if ! command -v docker-compose >/dev/null 2>&1; then
-  if command -v apt-get >/dev/null 2>&1; then
-    sudo apt-get install -y docker-compose-plugin || true
-  elif command -v yum >/dev/null 2>&1; then
-    sudo yum install -y docker-compose-plugin || true
-  fi
-fi
-
-# nginx
-if ! command -v nginx >/dev/null 2>&1; then
-  echo "Installing nginx..."
-  $PKG_INSTALL nginx -y || true
-  sudo systemctl enable --now nginx || true
-fi
-
-# add current user to docker group if possible
-if id -nG "$USER" 2>/dev/null | grep -qv docker; then
-  sudo usermod -aG docker "$USER" || true
-fi
-
-# show versions
-docker --version || true
-docker-compose --version || true
-nginx -v || true
-echo "REMOTE_PREP_DONE"
-REMOTE_EOF
-
-  if [ "$DRY_RUN" -eq 1 ]; then
-    log "[dry-run] would upload and run remote prep script"
-    rm -f "$remote_script"
+validate_ip() {
+    local ip=$1
+    if [[ ! "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        log_error "Invalid IP address format"
+        return 1
+    fi
     return 0
-  fi
-
-  scp -i "$SSH_KEY" -o BatchMode=yes "$remote_script" "${SSH_USER}@${REMOTE_HOST}:/tmp/remote_prep_${TIMESTAMP}.sh" >>"$LOGFILE" 2>&1 || die "Failed to upload remote prep script" 40
-  ssh -i "$SSH_KEY" -o BatchMode=yes "${SSH_USER}@${REMOTE_HOST}" "bash /tmp/remote_prep_${TIMESTAMP}.sh" >>"$LOGFILE" 2>&1 || die "Remote preparation failed" 41
-  ssh -i "$SSH_KEY" -o BatchMode=yes "${SSH_USER}@${REMOTE_HOST}" "rm -f /tmp/remote_prep_${TIMESTAMP}.sh" || true
-  rm -f "$remote_script"
-  log "Remote preparation completed"
 }
 
-########################################
-# 5) Transfer project files (rsync)
-########################################
-transfer_files() {
-  log "Transferring project files to remote..."
-  REMOTE_BASE_DIR="~/deployments"
-  # We'll use a timestamped folder to be idempotent
-  REMOTE_PROJECT_DIR="${REMOTE_BASE_DIR}/$(basename "$PROJECT_DIR")_${TIMESTAMP}"
-  RSYNC_EXCLUDES="--exclude .git --exclude node_modules --exclude __pycache__"
-
-  if [ "$DRY_RUN" -eq 1 ]; then
-    log "[dry-run] rsync -e \"ssh -i $SSH_KEY -o BatchMode=yes\" $RSYNC_EXCLUDES -avz \"$PROJECT_DIR/\" ${SSH_USER}@${REMOTE_HOST}:$REMOTE_PROJECT_DIR/"
+validate_port() {
+    local port=$1
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+        log_error "Invalid port number. Must be between 1-65535"
+        return 1
+    fi
     return 0
-  fi
-
-  ssh -i "$SSH_KEY" -o BatchMode=yes "${SSH_USER}@${REMOTE_HOST}" "mkdir -p ${REMOTE_BASE_DIR}" >>"$LOGFILE" 2>&1 || die "Failed to create remote base dir" 50
-  rsync -e "ssh -i $SSH_KEY -o BatchMode=yes" $RSYNC_EXCLUDES -avz "$PROJECT_DIR"/ "${SSH_USER}@${REMOTE_HOST}:${REMOTE_PROJECT_DIR}/" >>"$LOGFILE" 2>&1 || die "rsync failed" 51
-
-  log "Files copied to remote: ${REMOTE_PROJECT_DIR}"
 }
 
-########################################
-# 6) Deploy remotely: build/run containers, configure nginx
-########################################
-remote_deploy() {
-  log "Deploying application on remote..."
+validate_ssh_key() {
+    local key_path=$1
+    if [ ! -f "$key_path" ]; then
+        log_error "SSH key file not found: $key_path"
+        return 1
+    fi
+    
+    # Check key permissions
+    local perms=$(stat -c %a "$key_path" 2>/dev/null || stat -f %A "$key_path" 2>/dev/null)
+    if [ "$perms" != "600" ] && [ "$perms" != "400" ]; then
+        log_warn "SSH key permissions are $perms. Fixing to 600..."
+        chmod 600 "$key_path"
+    fi
+    return 0
+}
 
-  remote_deploy_script="$(mktemp)"
-  cat >"$remote_deploy_script" <<'REMOTE_DEPLOY_EOF'
-set -e
-PROJECT_DIR="$1"
-APP_PORT="$2"
-NAME="$3"
+#######################################
+# User Input Collection
+#######################################
 
-cd "$PROJECT_DIR" || exit 10
+collect_parameters() {
+    log_info "=== Collecting Deployment Parameters ==="
+    
+    # Git Repository URL
+    while true; do
+        read -p "Enter Git Repository URL: " GIT_REPO_URL
+        if validate_url "$GIT_REPO_URL"; then
+            break
+        fi
+    done
+    
+    # Personal Access Token
+    read -sp "Enter Personal Access Token (PAT): " GIT_PAT
+    echo
+    if [ -z "$GIT_PAT" ]; then
+        log_error "PAT cannot be empty"
+        exit 1
+    fi
+    
+    # Branch name
+    read -p "Enter branch name [main]: " GIT_BRANCH
+    GIT_BRANCH=${GIT_BRANCH:-main}
+    
+    # SSH Username
+    read -p "Enter SSH username: " SSH_USER
+    if [ -z "$SSH_USER" ]; then
+        log_error "SSH username cannot be empty"
+        exit 1
+    fi
+    
+    # Server IP
+    while true; do
+        read -p "Enter server IP address: " SERVER_IP
+        if validate_ip "$SERVER_IP"; then
+            break
+        fi
+    done
+    
+    # SSH Key Path
+    while true; do
+        read -p "Enter SSH key path [~/.ssh/id_rsa]: " SSH_KEY_PATH
+        SSH_KEY_PATH=${SSH_KEY_PATH:-~/.ssh/id_rsa}
+        SSH_KEY_PATH="${SSH_KEY_PATH/#\~/$HOME}"
+        if validate_ssh_key "$SSH_KEY_PATH"; then
+            break
+        fi
+    done
+    
+    # Application Port
+    while true; do
+        read -p "Enter application port (container internal port): " APP_PORT
+        if validate_port "$APP_PORT"; then
+            break
+        fi
+    done
+    
+    log_success "Parameters collected successfully"
+}
 
-# Stop and remove existing container if present
-if docker ps -a --format '{{.Names}}' | grep -q "^$NAME$"; then
-  docker rm -f "$NAME" || true
-fi
+#######################################
+# Repository Operations
+#######################################
 
-# Kill any process listening on APP_PORT (best-effort) to avoid bind errors
-if command -v ss >/dev/null 2>&1; then
-  if ss -ltn "( sport = :$APP_PORT )" | grep -q LISTEN; then
-    # attempt to find pid using fuser
-    sudo fuser -k "${APP_PORT}/tcp" || true
-  fi
-elif command -v lsof >/dev/null 2>&1; then
-  if lsof -i TCP:"$APP_PORT" | grep -q LISTEN; then
-    sudo fuser -k "${APP_PORT}/tcp" || true
-  fi
-fi
+clone_or_update_repo() {
+    log_info "=== Cloning/Updating Repository ==="
+    
+    mkdir -p "$TEMP_DIR"
+    cd "$TEMP_DIR"
+    
+    # Extract repo name from URL
+    REPO_NAME=$(basename "$GIT_REPO_URL" .git)
+    REPO_PATH="${TEMP_DIR}/${REPO_NAME}"
+    
+    # Prepare authenticated URL
+    if [[ "$GIT_REPO_URL" =~ ^https:// ]]; then
+        AUTH_URL=$(echo "$GIT_REPO_URL" | sed "s|https://|https://${GIT_PAT}@|")
+    else
+        AUTH_URL="$GIT_REPO_URL"
+    fi
+    
+    if [ -d "$REPO_PATH" ]; then
+        log_info "Repository exists. Pulling latest changes..."
+        cd "$REPO_PATH"
+        git fetch origin
+        git checkout "$GIT_BRANCH"
+        git pull origin "$GIT_BRANCH"
+    else
+        log_info "Cloning repository..."
+        git clone -b "$GIT_BRANCH" "$AUTH_URL" "$REPO_NAME"
+        cd "$REPO_PATH"
+    fi
+    
+    log_success "Repository ready at: $REPO_PATH"
+}
 
-# Build and run
-if [ -f docker-compose.yml ] || [ -f docker-compose.yaml ]; then
-  # bring down any previous
-  docker compose down --remove-orphans || docker-compose down --remove-orphans || true
-  docker compose up -d --build || docker-compose up -d --build
-else
-  docker build -t "$NAME" . || exit 20
-  docker run -d --name "$NAME" --restart unless-stopped -p 127.0.0.1:${APP_PORT}:${APP_PORT} "$NAME"
-fi
+verify_docker_files() {
+    log_info "=== Verifying Docker Configuration Files ==="
+    
+    cd "$REPO_PATH"
+    
+    if [ -f "docker-compose.yml" ] || [ -f "docker-compose.yaml" ]; then
+        log_success "Found docker-compose.yml"
+        COMPOSE_FILE=true
+        return 0
+    elif [ -f "Dockerfile" ]; then
+        log_success "Found Dockerfile"
+        COMPOSE_FILE=false
+        return 0
+    else
+        log_error "No Dockerfile or docker-compose.yml found in repository"
+        exit 1
+    fi
+}
 
-# Create nginx config
-NGINX_CONF="/etc/nginx/conf.d/${NAME}.conf"
-cat <<'NGINX_EOF' | sudo tee ${NGINX_CONF} > /dev/null
+#######################################
+# SSH Operations
+#######################################
+
+test_ssh_connection() {
+    log_info "=== Testing SSH Connection ==="
+    
+    if ssh -i "$SSH_KEY_PATH" -o ConnectTimeout=10 -o StrictHostKeyChecking=no \
+        "${SSH_USER}@${SERVER_IP}" "echo 'SSH connection successful'" &>/dev/null; then
+        log_success "SSH connection established"
+        return 0
+    else
+        log_error "Failed to establish SSH connection"
+        exit 1
+    fi
+}
+
+execute_remote_command() {
+    local cmd=$1
+    ssh -i "$SSH_KEY_PATH" -o StrictHostKeyChecking=no "${SSH_USER}@${SERVER_IP}" "$cmd"
+}
+
+#######################################
+# Remote Environment Setup
+#######################################
+
+prepare_remote_environment() {
+    log_info "=== Preparing Remote Environment ==="
+    
+    execute_remote_command "sudo apt-get update -y" || {
+        log_error "Failed to update packages"
+        exit 1
+    }
+    
+    log_info "Installing Docker..."
+    execute_remote_command "
+        if ! command -v docker &> /dev/null; then
+            sudo apt-get install -y apt-transport-https ca-certificates curl software-properties-common
+            curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+            echo 'deb [arch=\$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu \$(lsb_release -cs) stable' | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+            sudo apt-get update -y
+            sudo apt-get install -y docker-ce docker-ce-cli containerd.io
+        fi
+    " || log_warn "Docker might already be installed"
+    
+    log_info "Installing Docker Compose..."
+    execute_remote_command "
+        if ! command -v docker-compose &> /dev/null; then
+            sudo curl -L \"https://github.com/docker/compose/releases/latest/download/docker-compose-\$(uname -s)-\$(uname -m)\" -o /usr/local/bin/docker-compose
+            sudo chmod +x /usr/local/bin/docker-compose
+        fi
+    " || log_warn "Docker Compose might already be installed"
+    
+    log_info "Installing Nginx..."
+    execute_remote_command "
+        if ! command -v nginx &> /dev/null; then
+            sudo apt-get install -y nginx
+        fi
+    " || log_warn "Nginx might already be installed"
+    
+    log_info "Configuring Docker permissions..."
+    execute_remote_command "
+        sudo usermod -aG docker ${SSH_USER} || true
+        sudo systemctl enable docker
+        sudo systemctl start docker
+        sudo systemctl enable nginx
+        sudo systemctl start nginx
+    "
+    
+    # Verify installations
+    log_info "Verifying installations..."
+    local docker_version=$(execute_remote_command "docker --version")
+    local compose_version=$(execute_remote_command "docker-compose --version")
+    local nginx_version=$(execute_remote_command "nginx -v 2>&1")
+    
+    log_success "Docker: $docker_version"
+    log_success "Docker Compose: $compose_version"
+    log_success "Nginx: $nginx_version"
+}
+
+#######################################
+# Application Deployment
+#######################################
+
+deploy_application() {
+    log_info "=== Deploying Application ==="
+    
+    # Create remote directory
+    REMOTE_APP_DIR="/home/${SSH_USER}/app/${REPO_NAME}"
+    execute_remote_command "mkdir -p $REMOTE_APP_DIR"
+    
+    # Transfer files
+    log_info "Transferring project files..."
+    rsync -avz -e "ssh -i $SSH_KEY_PATH -o StrictHostKeyChecking=no" \
+        --exclude='.git' \
+        --exclude='node_modules' \
+        --exclude='*.log' \
+        "${REPO_PATH}/" \
+        "${SSH_USER}@${SERVER_IP}:${REMOTE_APP_DIR}/"
+    
+    log_success "Files transferred successfully"
+    
+    # Stop existing containers
+    log_info "Stopping existing containers..."
+    execute_remote_command "
+        cd $REMOTE_APP_DIR
+        if [ -f 'docker-compose.yml' ] || [ -f 'docker-compose.yaml' ]; then
+            docker-compose down || true
+        else
+            docker stop ${REPO_NAME}_container || true
+            docker rm ${REPO_NAME}_container || true
+        fi
+    "
+    
+    # Build and run
+    if [ "$COMPOSE_FILE" = true ]; then
+        log_info "Building and running with Docker Compose..."
+        execute_remote_command "
+            cd $REMOTE_APP_DIR
+            docker-compose build
+            docker-compose up -d
+        "
+    else
+        log_info "Building and running with Docker..."
+        execute_remote_command "
+            cd $REMOTE_APP_DIR
+            docker build -t ${REPO_NAME}_image .
+            docker run -d --name ${REPO_NAME}_container -p ${APP_PORT}:${APP_PORT} ${REPO_NAME}_image
+        "
+    fi
+    
+    log_success "Application deployed successfully"
+    
+    # Wait for container to be healthy
+    sleep 5
+    
+    # Verify container is running
+    local container_status=$(execute_remote_command "docker ps --filter name=${REPO_NAME} --format '{{.Status}}'")
+    if [ -n "$container_status" ]; then
+        log_success "Container is running: $container_status"
+    else
+        log_error "Container failed to start"
+        execute_remote_command "docker logs ${REPO_NAME}_container" || true
+        exit 1
+    fi
+}
+
+#######################################
+# Nginx Configuration
+#######################################
+
+configure_nginx() {
+    log_info "=== Configuring Nginx Reverse Proxy ==="
+    
+    local nginx_config="/etc/nginx/sites-available/${REPO_NAME}"
+    
+    execute_remote_command "
+        sudo tee $nginx_config > /dev/null <<'EOF'
 server {
     listen 80;
-    server_name _;
+    server_name ${SERVER_IP} _;
 
     location / {
-        proxy_pass http://127.0.0.1:APP_PORT_PLACEHOLDER;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_pass http://localhost:${APP_PORT};
         proxy_http_version 1.1;
-        proxy_set_header Connection "";
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host \$host;
+        proxy_cache_bypass \$http_upgrade;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
     }
 }
-NGINX_EOF
-
-# replace placeholder with actual port (using sed)
-sudo sed -i "s/APP_PORT_PLACEHOLDER/${APP_PORT}/g" ${NGINX_CONF}
-
-# test and reload nginx
-sudo nginx -t
-sudo systemctl reload nginx || sudo systemctl restart nginx || true
-
-# quick health check
-curl -sS -o /dev/null -w "%{http_code}" "http://127.0.0.1:${APP_PORT}" || true
-echo "DEPLOY_DONE"
-REMOTE_DEPLOY_EOF
-
-  if [ "$DRY_RUN" -eq 1 ]; then
-    log "[dry-run] would upload deploy script and run it on remote"
-    rm -f "$remote_deploy_script"
-    return 0
-  fi
-
-  scp -i "$SSH_KEY" -o BatchMode=yes "$remote_deploy_script" "${SSH_USER}@${REMOTE_HOST}:/tmp/remote_deploy_${TIMESTAMP}.sh" >>"$LOGFILE" 2>&1 || die "Failed to upload remote deploy script" 60
-  ssh -i "$SSH_KEY" -o BatchMode=yes "${SSH_USER}@${REMOTE_HOST}" "bash /tmp/remote_deploy_${TIMESTAMP}.sh '${REMOTE_PROJECT_DIR}' '${APP_PORT}' '${APP_NAME}'" >>"$LOGFILE" 2>&1 || die "Remote deploy failed" 61
-  ssh -i "$SSH_KEY" -o BatchMode=yes "${SSH_USER}@${REMOTE_HOST}" "rm -f /tmp/remote_deploy_${TIMESTAMP}.sh" || true
-  rm -f "$remote_deploy_script"
-  log "Remote deploy completed"
+EOF
+    "
+    
+    # Enable site
+    execute_remote_command "
+        sudo ln -sf $nginx_config /etc/nginx/sites-enabled/${REPO_NAME}
+        sudo rm -f /etc/nginx/sites-enabled/default
+    "
+    
+    # Test configuration
+    log_info "Testing Nginx configuration..."
+    execute_remote_command "sudo nginx -t"
+    
+    # Reload Nginx
+    execute_remote_command "sudo systemctl reload nginx"
+    
+    log_success "Nginx configured and reloaded successfully"
 }
 
-########################################
-# 7) Validate deployment
-########################################
-validate() {
-  log "Validating deployment..."
+#######################################
+# Deployment Validation
+#######################################
 
-  if [ "$DRY_RUN" -eq 1 ]; then
-    log "[dry-run] skipping remote validation"
-    return 0
-  fi
-
-  # Docker service check
-  ssh -i "$SSH_KEY" -o BatchMode=yes "${SSH_USER}@${REMOTE_HOST}" "sudo systemctl is-active --quiet docker" >>"$LOGFILE" 2>&1 || die "Docker service not active on remote" 70
-
-  # Container status
-  ssh -i "$SSH_KEY" -o BatchMode=yes "${SSH_USER}@${REMOTE_HOST}" "docker ps --filter 'name=${APP_NAME}' --format 'table {{.Names}}\\t{{.Status}}' || true" >>"$LOGFILE" 2>&1
-
-  # Test via nginx public endpoint
-  HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://${REMOTE_HOST}/api" || echo "000")
-  log "HTTP status for http://${REMOTE_HOST}/api : ${HTTP_STATUS}"
-
-  if [ "${HTTP_STATUS}" = "000" ]; then
-    die "Could not reach http://${REMOTE_HOST}/api (curl error)" 71
-  fi
-  if [ "${HTTP_STATUS}" != "200" ]; then
-    warn "Unexpected HTTP status ${HTTP_STATUS} (expected 200). Check logs."
-    ssh -i "$SSH_KEY" -o BatchMode=yes "${SSH_USER}@${REMOTE_HOST}" "sudo tail -n 80 /var/log/nginx/error.log" >>"$LOGFILE" 2>&1 || true
-    die "Deployment validation failed (HTTP ${HTTP_STATUS})" 72
-  fi
-
-  log "Validation successful (HTTP 200)."
-}
-
-########################################
-# 8) Cleanup remote resources
-########################################
-remote_cleanup() {
-  log "Running remote cleanup..."
-
-  cleanup_script="$(mktemp)"
-  cat >"$cleanup_script" <<'CLEAN_EOF'
-set -e
-NAME="$1"
-# stop and remove containers under deployments
-if [ -d ~/deployments ]; then
-  for d in ~/deployments/*; do
-    if [ -d "$d" ]; then
-      cd "$d" || continue
-      if [ -f docker-compose.yml ] || [ -f docker-compose.yaml ]; then
-        docker compose down --remove-orphans || docker-compose down --remove-orphans || true
-      else
-        CNAME="$(basename "$d")_container"
-        docker rm -f "$CNAME" || true
-      fi
+validate_deployment() {
+    log_info "=== Validating Deployment ==="
+    
+    # Check Docker service
+    local docker_status=$(execute_remote_command "sudo systemctl is-active docker")
+    if [ "$docker_status" = "active" ]; then
+        log_success "Docker service is running"
+    else
+        log_error "Docker service is not running"
+        exit 1
     fi
-  done
-fi
-# remove nginx conf created by script
-sudo rm -f /etc/nginx/conf.d/"$NAME".conf || true
-sudo systemctl reload nginx || true
-echo "CLEAN_DONE"
-CLEAN_EOF
-
-  if [ "$DRY_RUN" -eq 1 ]; then
-    log "[dry-run] would run cleanup script on remote"
-    rm -f "$cleanup_script"
-    return 0
-  fi
-
-  scp -i "$SSH_KEY" -o BatchMode=yes "$cleanup_script" "${SSH_USER}@${REMOTE_HOST}:/tmp/cleanup_${TIMESTAMP}.sh" >>"$LOGFILE" 2>&1 || die "Failed to upload cleanup script" 80
-  ssh -i "$SSH_KEY" -o BatchMode=yes "${SSH_USER}@${REMOTE_HOST}" "bash /tmp/cleanup_${TIMESTAMP}.sh '${APP_NAME}'" >>"$LOGFILE" 2>&1 || die "Remote cleanup failed" 81
-  ssh -i "$SSH_KEY" -o BatchMode=yes "${SSH_USER}@${REMOTE_HOST}" "rm -f /tmp/cleanup_${TIMESTAMP}.sh" || true
-  rm -f "$cleanup_script"
-  log "Remote cleanup completed"
+    
+    # Check container health
+    local container_count=$(execute_remote_command "docker ps --filter name=${REPO_NAME} | wc -l")
+    if [ "$container_count" -gt 1 ]; then
+        log_success "Container is running"
+    else
+        log_error "Container is not running"
+        exit 1
+    fi
+    
+    # Check Nginx
+    local nginx_status=$(execute_remote_command "sudo systemctl is-active nginx")
+    if [ "$nginx_status" = "active" ]; then
+        log_success "Nginx is running"
+    else
+        log_error "Nginx is not running"
+        exit 1
+    fi
+    
+    # Test endpoint locally on server
+    log_info "Testing application endpoint..."
+    sleep 3
+    
+    local http_response=$(execute_remote_command "curl -s -o /dev/null -w '%{http_code}' http://localhost:${APP_PORT}/ || echo '000'")
+    if [ "$http_response" = "200" ] || [ "$http_response" = "301" ] || [ "$http_response" = "302" ]; then
+        log_success "Application is responding (HTTP $http_response)"
+    else
+        log_warn "Application returned HTTP $http_response"
+    fi
+    
+    # Test through Nginx
+    local nginx_response=$(execute_remote_command "curl -s -o /dev/null -w '%{http_code}' http://localhost/ || echo '000'")
+    if [ "$nginx_response" = "200" ] || [ "$nginx_response" = "301" ] || [ "$nginx_response" = "302" ]; then
+        log_success "Nginx proxy is working (HTTP $nginx_response)"
+    else
+        log_warn "Nginx returned HTTP $nginx_response"
+    fi
+    
+    log_success "=== Deployment Validation Complete ==="
+    log_info "Application URL: http://${SERVER_IP}"
+    log_info "Direct application port: ${APP_PORT}"
 }
 
-########################################
-# Main flow
-########################################
+#######################################
+# Cleanup Functions
+#######################################
+
+cleanup_local() {
+    log_info "Cleaning up local temporary files..."
+    if [ -d "$TEMP_DIR" ]; then
+        rm -rf "$TEMP_DIR"
+    fi
+    log_success "Local cleanup complete"
+}
+
+cleanup_remote() {
+    log_info "=== Performing Remote Cleanup ==="
+    
+    execute_remote_command "
+        cd /home/${SSH_USER}/app/${REPO_NAME} 2>/dev/null || exit 0
+        if [ -f 'docker-compose.yml' ] || [ -f 'docker-compose.yaml' ]; then
+            docker-compose down -v
+        else
+            docker stop ${REPO_NAME}_container || true
+            docker rm ${REPO_NAME}_container || true
+            docker rmi ${REPO_NAME}_image || true
+        fi
+        
+        sudo rm -f /etc/nginx/sites-enabled/${REPO_NAME}
+        sudo rm -f /etc/nginx/sites-available/${REPO_NAME}
+        sudo systemctl reload nginx
+        
+        rm -rf /home/${SSH_USER}/app/${REPO_NAME}
+    "
+    
+    log_success "Remote cleanup complete"
+}
+
+#######################################
+# Main Function
+#######################################
+
 main() {
-  collect_inputs
-  prechecks_and_clone
-
-  # derive APP_NAME from repo dir for nicer naming and idempotency
-  APP_NAME="$(basename "$PROJECT_DIR" | tr '[:upper:]' '[:lower:]' | tr -c '[:alnum:]' '-' )"
-  log "Using application name: ${APP_NAME}"
-
-  ssh_check
-
-  if [ "$CLEANUP" -eq 1 ]; then
-    remote_prep   # ensure remote available
-    transfer_files # safe: ensures remote base dir exists
-    remote_cleanup
-    log "Cleanup finished"
-    return 0
-  fi
-
-  remote_prep
-  transfer_files
-  remote_deploy
-  validate
+    echo "============================================"
+    echo "  Dockerized Application Deployment Script"
+    echo "============================================"
+    echo ""
+    
+    log_info "Deployment started at $(date)"
+    log_info "Log file: $LOG_FILE"
+    
+    # Check for cleanup flag
+    if [ "${1:-}" = "--cleanup" ]; then
+        CLEANUP_MODE=true
+        collect_parameters
+        cleanup_remote
+        cleanup_local
+        log_success "Cleanup completed successfully"
+        exit 0
+    fi
+    
+    # Main deployment flow
+    collect_parameters
+    clone_or_update_repo
+    verify_docker_files
+    test_ssh_connection
+    prepare_remote_environment
+    deploy_application
+    configure_nginx
+    validate_deployment
+    cleanup_local
+    
+    log_success "=== DEPLOYMENT COMPLETED SUCCESSFULLY ==="
+    log_info "Application is now live at: http://${SERVER_IP}"
+    log_info "Deployment log saved to: $LOG_FILE"
+    
+    echo ""
+    echo "============================================"
+    echo "  Deployment Summary"
+    echo "============================================"
+    echo "Repository: $REPO_NAME"
+    echo "Branch: $GIT_BRANCH"
+    echo "Server: $SERVER_IP"
+    echo "Application Port: $APP_PORT"
+    echo "Access URL: http://${SERVER_IP}"
+    echo "============================================"
 }
 
+# Run main function
 main "$@"

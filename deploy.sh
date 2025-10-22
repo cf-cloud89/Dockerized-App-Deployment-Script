@@ -2,6 +2,7 @@
 
 #######################################
 # Dockerized Application Deployment Script
+# Author: DevOps Track Stage 1
 # Description: Automates deployment of Dockerized apps to remote servers
 #######################################
 
@@ -183,8 +184,8 @@ clone_or_update_repo() {
     mkdir -p "$TEMP_DIR"
     cd "$TEMP_DIR"
     
-    # Extract repo name from URL
-    REPO_NAME=$(basename "$GIT_REPO_URL" .git)
+    # Extract repo name from URL and convert to lowercase, replace special chars
+    REPO_NAME=$(basename "$GIT_REPO_URL" .git | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]-' | sed 's/--*/-/g' | sed 's/^-//' | sed 's/-$//')
     REPO_PATH="${TEMP_DIR}/${REPO_NAME}"
     
     # Prepare authenticated URL
@@ -257,7 +258,7 @@ execute_remote_command() {
 prepare_remote_environment() {
     log_info "=== Preparing Remote Environment ==="
     
-    execute_remote_command "sudo apt-get update -y" || {
+    execute_remote_command "sudo dnf update -y" || {
         log_error "Failed to update packages"
         exit 1
     }
@@ -265,11 +266,11 @@ prepare_remote_environment() {
     log_info "Installing Docker..."
     execute_remote_command "
         if ! command -v docker &> /dev/null; then
-            sudo apt-get install -y apt-transport-https ca-certificates curl software-properties-common
+            sudo dnf install -y dnf-transport-https ca-certificates curl software-properties-common
             curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
-            echo 'deb [arch=\$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu \$(lsb_release -cs) stable' | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-            sudo apt-get update -y
-            sudo apt-get install -y docker-ce docker-ce-cli containerd.io
+            echo 'deb [arch=\$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu \$(lsb_release -cs) stable' | sudo tee /etc/dnf/sources.list.d/docker.list > /dev/null
+            sudo dnf update -y
+            sudo dnf install -y docker-ce docker-ce-cli containerd.io
         fi
     " || log_warn "Docker might already be installed"
     
@@ -284,7 +285,7 @@ prepare_remote_environment() {
     log_info "Installing Nginx..."
     execute_remote_command "
         if ! command -v nginx &> /dev/null; then
-            sudo apt-get install -y nginx
+            sudo dnf install -y nginx
         fi
     " || log_warn "Nginx might already be installed"
     
@@ -331,16 +332,16 @@ deploy_application() {
     log_success "Files transferred successfully"
     
     # Stop existing containers
-    log_info "Stopping existing containers..."
+    log_info "Stopping existing containers (if any)..."
     execute_remote_command "
         cd $REMOTE_APP_DIR
         if [ -f 'docker-compose.yml' ] || [ -f 'docker-compose.yaml' ]; then
-            docker-compose down || true
+            docker-compose down 2>/dev/null || true
         else
-            docker stop ${REPO_NAME}_container || true
-            docker rm ${REPO_NAME}_container || true
+            docker stop ${REPO_NAME}_container 2>/dev/null || true
+            docker rm ${REPO_NAME}_container 2>/dev/null || true
         fi
-    "
+    " 2>/dev/null || log_info "No existing containers to stop"
     
     # Build and run
     if [ "$COMPOSE_FILE" = true ]; then
@@ -352,10 +353,13 @@ deploy_application() {
         "
     else
         log_info "Building and running with Docker..."
+        # Ensure image and container names are Docker-compliant (lowercase, no special chars)
+        IMAGE_NAME="${REPO_NAME}-image"
+        CONTAINER_NAME="${REPO_NAME}-container"
         execute_remote_command "
             cd $REMOTE_APP_DIR
-            docker build -t ${REPO_NAME}_image .
-            docker run -d --name ${REPO_NAME}_container -p ${APP_PORT}:${APP_PORT} ${REPO_NAME}_image
+            docker build -t \${IMAGE_NAME} .
+            docker run -d --name \${CONTAINER_NAME} -p ${APP_PORT}:${APP_PORT} \${IMAGE_NAME}
         "
     fi
     
@@ -364,13 +368,14 @@ deploy_application() {
     # Wait for container to be healthy
     sleep 5
     
-    # Verify container is running
-    local container_status=$(execute_remote_command "docker ps --filter name=${REPO_NAME} --format '{{.Status}}'")
+    # Verify container is running (search for repo name in any running container)
+    local container_status=$(execute_remote_command "docker ps --filter name=${REPO_NAME} --format '{{.Status}}' | head -n1")
     if [ -n "$container_status" ]; then
         log_success "Container is running: $container_status"
     else
         log_error "Container failed to start"
-        execute_remote_command "docker logs ${REPO_NAME}_container" || true
+        log_info "Checking container logs..."
+        execute_remote_command "docker ps -a --filter name=${REPO_NAME} --format '{{.Names}}' | head -n1 | xargs -r docker logs --tail 50" || true
         exit 1
     fi
 }
@@ -497,11 +502,13 @@ cleanup_remote() {
     execute_remote_command "
         cd /home/${SSH_USER}/app/${REPO_NAME} 2>/dev/null || exit 0
         if [ -f 'docker-compose.yml' ] || [ -f 'docker-compose.yaml' ]; then
-            docker-compose down -v
+            docker-compose down -v 2>/dev/null || true
         else
-            docker stop ${REPO_NAME}_container || true
-            docker rm ${REPO_NAME}_container || true
-            docker rmi ${REPO_NAME}_image || true
+            # Stop and remove containers matching repo name
+            docker ps -a --filter name=${REPO_NAME} --format '{{.Names}}' | xargs -r docker stop 2>/dev/null || true
+            docker ps -a --filter name=${REPO_NAME} --format '{{.Names}}' | xargs -r docker rm 2>/dev/null || true
+            # Remove images matching repo name
+            docker images --filter reference='*${REPO_NAME}*' --format '{{.Repository}}:{{.Tag}}' | xargs -r docker rmi 2>/dev/null || true
         fi
         
         sudo rm -f /etc/nginx/sites-enabled/${REPO_NAME}

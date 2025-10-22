@@ -2,6 +2,7 @@
 
 #######################################
 # Dockerized Application Deployment Script
+# Author: DevOps Track Stage 1
 # Description: Automates deployment of Dockerized apps to remote servers
 #######################################
 
@@ -332,13 +333,15 @@ deploy_application() {
     
     # Stop existing containers
     log_info "Stopping existing containers (if any)..."
+    IMAGE_NAME="${REPO_NAME}-image"
+    CONTAINER_NAME="${REPO_NAME}-container"
     execute_remote_command "
         cd $REMOTE_APP_DIR
         if [ -f 'docker-compose.yml' ] || [ -f 'docker-compose.yaml' ]; then
             docker-compose down 2>/dev/null || true
         else
-            docker stop ${REPO_NAME}_container 2>/dev/null || true
-            docker rm ${REPO_NAME}_container 2>/dev/null || true
+            docker stop ${CONTAINER_NAME} 2>/dev/null || true
+            docker rm ${CONTAINER_NAME} 2>/dev/null || true
         fi
     " 2>/dev/null || log_info "No existing containers to stop"
     
@@ -357,8 +360,8 @@ deploy_application() {
         CONTAINER_NAME="${REPO_NAME}-container"
         execute_remote_command "
             cd $REMOTE_APP_DIR
-            docker build -t \${IMAGE_NAME} .
-            docker run -d --name \${CONTAINER_NAME} -p ${APP_PORT}:${APP_PORT} \${IMAGE_NAME}
+            docker build -t ${IMAGE_NAME} .
+            docker run -d --name ${CONTAINER_NAME} -p ${APP_PORT}:${APP_PORT} ${IMAGE_NAME}
         "
     fi
     

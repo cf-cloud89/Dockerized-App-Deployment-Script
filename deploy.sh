@@ -126,6 +126,30 @@ calculate_repo_name() {
     log_info "Calculated repository identifier: ${REPO_NAME}"
 }
 
+determine_remote_os() {
+    # Check for the existence of apt (Debian/Ubuntu) or dnf/yum (RHEL/CentOS/Fedora)
+    local os_type=$(execute_remote_command "
+        if command -v apt &> /dev/null; then 
+            echo 'APT'
+        elif command -v dnf &> /dev/null || command -v yum &> /dev/null; then 
+            echo 'DNF'
+        else 
+            echo 'UNKNOWN'
+        fi
+    ")
+    
+    if [ "$os_type" = "APT" ]; then
+        REMOTE_PKG_MANAGER="apt"
+        log_info "Remote OS detected as Debian/Ubuntu (using APT)"
+    elif [ "$os_type" = "DNF" ]; then
+        REMOTE_PKG_MANAGER="dnf"
+        log_info "Remote OS detected as RHEL/Fedora/CentOS (using DNF)"
+    else
+        log_error "Unsupported remote OS/package manager detected."
+        exit 1
+    fi
+}
+
 #######################################
 # User Input Collection
 #######################################
@@ -272,21 +296,33 @@ execute_remote_command() {
 prepare_remote_environment() {
     log_info "=== Preparing Remote Environment ==="
     
-    execute_remote_command "sudo dnf update -y" || {
+    # Update packages using the determined manager
+    execute_remote_command "sudo $REMOTE_PKG_MANAGER update -y" || {
         log_error "Failed to update packages"
         exit 1
     }
     
     log_info "Installing Docker..."
-    execute_remote_command "
-        if ! command -v docker &> /dev/null; then
-            sudo dnf install -y dnf-transport-https ca-certificates curl software-properties-common
-            curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
-            echo 'deb [arch=\$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu \$(lsb_release -cs) stable' | sudo tee /etc/dnf/sources.list.d/docker.list > /dev/null
-            sudo dnf update -y
-            sudo dnf install -y docker-ce docker-ce-cli containerd.io
-        fi
-    " || log_warn "Docker might already be installed"
+    # The Docker installation logic needs to be platform-specific
+    if [ "$REMOTE_PKG_MANAGER" = "apt" ]; then
+        execute_remote_command "
+            if ! command -v docker &> /dev/null; then
+                sudo apt install -y apt-transport-https ca-certificates curl software-properties-common
+                curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+                echo \"deb [arch=\$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu \$(lsb_release -cs) stable\" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+                sudo apt update -y
+                sudo apt install -y docker-ce docker-ce-cli containerd.io
+            fi
+        " || log_warn "Docker might already be installed"
+    else # dnf/yum
+        execute_remote_command "
+            if ! command -v docker &> /dev/null; then
+                sudo $REMOTE_PKG_MANAGER install -y yum-utils
+                sudo yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+                sudo $REMOTE_PKG_MANAGER install -y docker-ce docker-ce-cli containerd.io
+            fi
+        " || log_warn "Docker might already be installed"
+    fi
     
     log_info "Installing Docker Compose..."
     execute_remote_command "
@@ -295,11 +331,11 @@ prepare_remote_environment() {
             sudo chmod +x /usr/local/bin/docker-compose
         fi
     " || log_warn "Docker Compose might already be installed"
-    
+
     log_info "Installing Nginx..."
     execute_remote_command "
         if ! command -v nginx &> /dev/null; then
-            sudo dnf install -y nginx
+            sudo $REMOTE_PKG_MANAGER install -y nginx
         fi
     " || log_warn "Nginx might already be installed"
     
@@ -416,6 +452,13 @@ configure_nginx() {
     
     local nginx_config="/etc/nginx/sites-available/${REPO_NAME}"
     
+    # Explicitly create required Nginx directories on the remote server
+    log_info "Creating Nginx configuration directories on remote server..."
+    execute_remote_command "
+        sudo mkdir -p /etc/nginx/sites-available
+        sudo mkdir -p /etc/nginx/sites-enabled
+    "
+
     execute_remote_command "
         sudo tee $nginx_config > /dev/null <<'EOF'
 server {
@@ -561,11 +604,12 @@ main() {
     log_info "Deployment started at $(date)"
     log_info "Log file: $LOG_FILE"
     
-    # Check for cleanup flag
+    # Cleanup flow
     if [ "${1:-}" = "--cleanup" ]; then
         CLEANUP_MODE=true
         collect_parameters
         calculate_repo_name
+        determine_remote_os
         cleanup_remote
         cleanup_local
         log_success "Cleanup completed successfully"
@@ -575,6 +619,7 @@ main() {
     # Main deployment flow
     collect_parameters
     calculate_repo_name
+    determine_remote_os
     clone_or_update_repo
     verify_docker_files
     test_ssh_connection

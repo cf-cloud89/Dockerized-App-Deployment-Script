@@ -370,14 +370,45 @@ deploy_application() {
     REMOTE_APP_DIR="/home/${SSH_USER}/app/${REPO_NAME}"
     execute_remote_command "mkdir -p $REMOTE_APP_DIR"
     
-    # Transfer files
+    # Transfer files - check for rsync first
     log_info "Transferring project files..."
-    rsync -avz -e "ssh -i $SSH_KEY_PATH -o StrictHostKeyChecking=no" \
-        --exclude='.git' \
-        --exclude='node_modules' \
-        --exclude='*.log' \
-        "${REPO_PATH}/" \
-        "${SSH_USER}@${SERVER_IP}:${REMOTE_APP_DIR}/"
+    
+    if command -v rsync &> /dev/null; then
+        log_info "Using rsync for file transfer..."
+        rsync -avz -e "ssh -i $SSH_KEY_PATH -o StrictHostKeyChecking=no" \
+            --exclude='.git' \
+            --exclude='node_modules' \
+            --exclude='*.log' \
+            --exclude='__pycache__' \
+            --exclude='*.pyc' \
+            "${REPO_PATH}/" \
+            "${SSH_USER}@${SERVER_IP}:${REMOTE_APP_DIR}/"
+    else
+        log_warn "rsync not found, using scp as fallback..."
+        # Create a temporary tarball excluding unwanted files
+        cd "${REPO_PATH}"
+        tar --exclude='.git' \
+            --exclude='node_modules' \
+            --exclude='*.log' \
+            --exclude='__pycache__' \
+            --exclude='*.pyc' \
+            -czf /tmp/deploy_${REPO_NAME}.tar.gz .
+        
+        # Transfer tarball
+        scp -i "$SSH_KEY_PATH" -o StrictHostKeyChecking=no \
+            /tmp/deploy_${REPO_NAME}.tar.gz \
+            "${SSH_USER}@${SERVER_IP}:${REMOTE_APP_DIR}/"
+        
+        # Extract on remote server
+        execute_remote_command "
+            cd ${REMOTE_APP_DIR}
+            tar -xzf deploy_${REPO_NAME}.tar.gz
+            rm -f deploy_${REPO_NAME}.tar.gz
+        "
+        
+        # Cleanup local tarball
+        rm -f /tmp/deploy_${REPO_NAME}.tar.gz
+    fi
     
     log_success "Files transferred successfully"
     
@@ -429,7 +460,7 @@ deploy_application() {
     log_success "Application deployed successfully"
     
     # Wait for container to be healthy
-    sleep 5
+    sleep 15
     
     # Verify container is running (search for repo name in any running container)
     local container_status=$(execute_remote_command "docker ps --filter name=${REPO_NAME} --format '{{.Status}}' | head -n1")

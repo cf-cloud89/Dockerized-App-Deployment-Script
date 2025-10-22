@@ -258,7 +258,7 @@ execute_remote_command() {
 prepare_remote_environment() {
     log_info "=== Preparing Remote Environment ==="
     
-    execute_remote_command "sudo dnf update -y" || {
+    execute_remote_command "sudo apt-get update -y" || {
         log_error "Failed to update packages"
         exit 1
     }
@@ -266,11 +266,11 @@ prepare_remote_environment() {
     log_info "Installing Docker..."
     execute_remote_command "
         if ! command -v docker &> /dev/null; then
-            sudo dnf install -y dnf-transport-https ca-certificates curl software-properties-common
+            sudo apt-get install -y apt-transport-https ca-certificates curl software-properties-common
             curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
-            echo 'deb [arch=\$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu \$(lsb_release -cs) stable' | sudo tee /etc/dnf/sources.list.d/docker.list > /dev/null
-            sudo dnf update -y
-            sudo dnf install -y docker-ce docker-ce-cli containerd.io
+            echo 'deb [arch=\$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu \$(lsb_release -cs) stable' | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+            sudo apt-get update -y
+            sudo apt-get install -y docker-ce docker-ce-cli containerd.io
         fi
     " || log_warn "Docker might already be installed"
     
@@ -285,7 +285,7 @@ prepare_remote_environment() {
     log_info "Installing Nginx..."
     execute_remote_command "
         if ! command -v nginx &> /dev/null; then
-            sudo dnf install -y nginx
+            sudo apt-get install -y nginx
         fi
     " || log_warn "Nginx might already be installed"
     
@@ -335,7 +335,18 @@ deploy_application() {
     log_info "Stopping existing containers (if any)..."
     IMAGE_NAME="${REPO_NAME}-image"
     CONTAINER_NAME="${REPO_NAME}-container"
+    
+    # First, check for any containers using the target port
+    log_info "Checking for containers using port ${APP_PORT}..."
     execute_remote_command "
+        # Find and stop containers using the target port
+        CONTAINERS_ON_PORT=\$(docker ps --format '{{.Names}}' --filter publish=${APP_PORT})
+        if [ -n \"\$CONTAINERS_ON_PORT\" ]; then
+            echo \"Found containers on port ${APP_PORT}: \$CONTAINERS_ON_PORT\"
+            echo \"\$CONTAINERS_ON_PORT\" | xargs -r docker stop
+            echo \"\$CONTAINERS_ON_PORT\" | xargs -r docker rm
+        fi
+        
         cd $REMOTE_APP_DIR
         if [ -f 'docker-compose.yml' ] || [ -f 'docker-compose.yaml' ]; then
             docker-compose down 2>/dev/null || true

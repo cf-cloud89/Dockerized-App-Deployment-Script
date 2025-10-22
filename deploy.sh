@@ -111,6 +111,22 @@ validate_ssh_key() {
 }
 
 #######################################
+# Helper Functions
+#######################################
+
+calculate_repo_name() {
+    # Extract repo name from URL and convert to lowercase, replace special chars
+    REPO_NAME=$(basename "$GIT_REPO_URL" .git | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]-' | sed 's/--*/-/g' | sed 's/^-//' | sed 's/-$//')
+    
+    # Check if REPO_NAME is empty (error case)
+    if [ -z "$REPO_NAME" ]; then
+        log_error "Could not determine repository name from URL."
+        exit 1
+    fi
+    log_info "Calculated repository identifier: ${REPO_NAME}"
+}
+
+#######################################
 # User Input Collection
 #######################################
 
@@ -183,8 +199,7 @@ clone_or_update_repo() {
     mkdir -p "$TEMP_DIR"
     cd "$TEMP_DIR"
     
-    # Extract repo name from URL and convert to lowercase, replace special chars
-    REPO_NAME=$(basename "$GIT_REPO_URL" .git | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]-' | sed 's/--*/-/g' | sed 's/^-//' | sed 's/-$//')
+    # Extract repo path
     REPO_PATH="${TEMP_DIR}/${REPO_NAME}"
     
     # Prepare authenticated URL
@@ -550,6 +565,7 @@ main() {
     if [ "${1:-}" = "--cleanup" ]; then
         CLEANUP_MODE=true
         collect_parameters
+        calculate_repo_name
         cleanup_remote
         cleanup_local
         log_success "Cleanup completed successfully"

@@ -2,7 +2,6 @@
 
 #######################################
 # Dockerized Application Deployment Script
-# Author: DevOps Track Stage 1
 # Description: Automates deployment of Dockerized apps to remote servers
 #######################################
 

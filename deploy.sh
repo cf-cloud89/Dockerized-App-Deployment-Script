@@ -1,9 +1,9 @@
 #!/bin/bash
 
-#######################################
+########################################################################
 # Dockerized Application Deployment Script
 # Description: Automates deployment of Dockerized apps to remote servers
-#######################################
+########################################################################
 
 set -euo pipefail
 
@@ -20,9 +20,9 @@ LOG_FILE="${SCRIPT_DIR}/deploy_$(date +%Y%m%d_%H%M%S).log"
 TEMP_DIR="${SCRIPT_DIR}/temp_deploy"
 CLEANUP_MODE=false
 
-#######################################
+#######################
 # Logging Functions
-#######################################
+#######################
 
 log() {
     local level=$1
@@ -48,9 +48,9 @@ log_error() {
     echo -e "${RED}[ERROR]${NC} $*" | tee -a "$LOG_FILE"
 }
 
-#######################################
+######################
 # Error Handling
-#######################################
+######################
 
 cleanup_on_error() {
     log_error "Script encountered an error. Cleaning up..."
@@ -63,9 +63,9 @@ cleanup_on_error() {
 trap cleanup_on_error ERR
 trap 'log_info "Script interrupted by user"; exit 130' INT TERM
 
-#######################################
+###########################
 # Validation Functions
-#######################################
+###########################
 
 validate_url() {
     local url=$1
@@ -110,15 +110,15 @@ validate_ssh_key() {
     return 0
 }
 
-#######################################
+#######################
 # Helper Functions
-#######################################
+#######################
 
 calculate_repo_name() {
-    # Extract repo name from URL and convert to lowercase, replace special chars
+    # Extract repo name from URL and convert to lowercase, replace special characters
     REPO_NAME=$(basename "$GIT_REPO_URL" .git | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]-' | sed 's/--*/-/g' | sed 's/^-//' | sed 's/-$//')
     
-    # Check if REPO_NAME is empty (error case)
+    # Check if REPO_NAME is empty
     if [ -z "$REPO_NAME" ]; then
         log_error "Could not determine repository name from URL."
         exit 1
@@ -150,9 +150,9 @@ determine_remote_os() {
     fi
 }
 
-#######################################
+############################
 # User Input Collection
-#######################################
+############################
 
 collect_parameters() {
     log_info "=== Collecting Deployment Parameters ==="
@@ -213,9 +213,9 @@ collect_parameters() {
     log_success "Parameters collected successfully"
 }
 
-#######################################
+#############################
 # Repository Operations
-#######################################
+#############################
 
 clone_or_update_repo() {
     log_info "=== Cloning/Updating Repository ==="
@@ -267,9 +267,9 @@ verify_docker_files() {
     fi
 }
 
-#######################################
+#####################
 # SSH Operations
-#######################################
+#####################
 
 test_ssh_connection() {
     log_info "=== Testing SSH Connection ==="
@@ -289,9 +289,9 @@ execute_remote_command() {
     ssh -i "$SSH_KEY_PATH" -o StrictHostKeyChecking=no "${SSH_USER}@${SERVER_IP}" "$cmd"
 }
 
-#######################################
+##############################
 # Remote Environment Setup
-#######################################
+##############################
 
 prepare_remote_environment() {
     log_info "=== Preparing Remote Environment ==="
@@ -359,9 +359,9 @@ prepare_remote_environment() {
     log_success "Nginx: $nginx_version"
 }
 
-#######################################
+############################
 # Application Deployment
-#######################################
+############################
 
 deploy_application() {
     log_info "=== Deploying Application ==="
@@ -447,7 +447,7 @@ deploy_application() {
         "
     else
         log_info "Building and running with Docker..."
-        # Ensure image and container names are Docker-compliant (lowercase, no special chars)
+        # Ensure image and container names are Docker-compliant (lowercase, no special characters)
         IMAGE_NAME="${REPO_NAME}-image"
         CONTAINER_NAME="${REPO_NAME}-container"
         execute_remote_command "
@@ -474,9 +474,9 @@ deploy_application() {
     fi
 }
 
-#######################################
+##########################
 # Nginx Configuration
-#######################################
+##########################
 
 configure_nginx() {
     log_info "=== Configuring Nginx Reverse Proxy ==="
@@ -527,9 +527,9 @@ EOF
     log_success "Nginx configured and reloaded successfully"
 }
 
-#######################################
+###########################
 # Deployment Validation
-#######################################
+###########################
 
 validate_deployment() {
     log_info "=== Validating Deployment ==="
@@ -585,9 +585,9 @@ validate_deployment() {
     log_info "Direct application port: ${APP_PORT}"
 }
 
-#######################################
+######################
 # Cleanup Functions
-#######################################
+######################
 
 cleanup_local() {
     log_info "Cleaning up local temporary files..."
@@ -622,9 +622,9 @@ cleanup_remote() {
     log_success "Remote cleanup complete"
 }
 
-#######################################
+###################
 # Main Function
-#######################################
+###################
 
 main() {
     echo "============================================"
